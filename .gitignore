@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Native builds
+build/
+cmake-build-*/
+CMakeFiles/
+*.o
+*.obj
+*.out
+*.exe
+
+# Local datasets and generated artifacts
+/dataset/*
+!/dataset/yeast/
+/groundtruth/*
+!/groundtruth/yeast.txt
+data/
+cache/
+cache_store/
+runs/
+results/
+logs/
+*.pkl
+*.pickle
+*.jsonl
+*.csv.gz
+*.7z
+*.zip
+
+# Local/editor files
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+
+# LaTeX build products
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+!supplementary/supplementary.pdf

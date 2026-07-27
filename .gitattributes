@@ -1,0 +1,4 @@
+*.graph text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.pdf -text
