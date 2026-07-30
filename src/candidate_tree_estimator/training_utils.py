@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import math
-import zlib
 
 import numpy as np
 import pandas as pd
 import torch
 
 
-VALIDATION_FRACTION_OF_OUTER_TRAIN = 0.125
 NATIVE_SCALE_FEATURE_INDICES = (9, 10)
 TAIL_THRESHOLDS = (1e2, 1e3, 1e4, 1e5, 1e6, 1e7)
 
@@ -140,68 +138,20 @@ def normalize_fold(
     return train_out, eval_out, diagnostics
 
 
-def stable_validation_indices(
+def outer_fold_indices(
     frame: pd.DataFrame,
     outer_fold: int,
-    validation_seed: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     folds = frame["fold"].to_numpy(dtype=int)
     test_index = np.flatnonzero(folds == outer_fold)
-    outer_train_index = np.flatnonzero(folds != outer_fold)
-    query_sizes = frame["query_size"].to_numpy(dtype=int)
-    query_names = frame["query_name"].astype(str).to_numpy()
-    dataset = str(frame["dataset"].iloc[0])
-    validation_parts: list[np.ndarray] = []
-
-    for query_size in sorted(set(query_sizes[outer_train_index])):
-        candidates = outer_train_index[
-            query_sizes[outer_train_index] == query_size
-        ]
-        requested = int(
-            round(
-                len(candidates)
-                * VALIDATION_FRACTION_OF_OUTER_TRAIN
-            )
-        )
-        validation_count = min(
-            max(1, requested),
-            max(1, len(candidates) - 1),
-        )
-        scores = np.asarray(
-            [
-                zlib.crc32(
-                    (
-                        f"{dataset}|{query_size}|{query_names[index]}|"
-                        f"{outer_fold}|{validation_seed}"
-                    ).encode("utf-8")
-                )
-                for index in candidates
-            ],
-            dtype=np.uint32,
-        )
-        order = np.lexsort((query_names[candidates], scores))
-        validation_parts.append(
-            np.sort(candidates[order[:validation_count]])
-        )
-
-    validation_index = np.sort(np.concatenate(validation_parts))
-    train_index = np.setdiff1d(
-        outer_train_index,
-        validation_index,
-        assume_unique=True,
-    )
-    if np.intersect1d(train_index, validation_index).size:
-        raise RuntimeError("train/validation overlap")
-    if np.intersect1d(test_index, outer_train_index).size:
+    train_index = np.flatnonzero(folds != outer_fold)
+    if not len(train_index) or not len(test_index):
+        raise RuntimeError("empty outer train or test partition")
+    if np.intersect1d(train_index, test_index).size:
         raise RuntimeError("outer train/test overlap")
-    if (
-        len(train_index)
-        + len(validation_index)
-        + len(test_index)
-        != len(frame)
-    ):
+    if len(train_index) + len(test_index) != len(frame):
         raise RuntimeError("split coverage mismatch")
-    return train_index, validation_index, test_index
+    return train_index, test_index
 
 
 def size_balanced_weights(

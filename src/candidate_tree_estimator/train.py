@@ -22,9 +22,9 @@ from candidate_tree_estimator.model import build_estimator
 from candidate_tree_estimator.training_utils import (
     condition_values,
     normalize_fold,
+    outer_fold_indices,
     qerror_from_logs,
     size_balanced_weights,
-    stable_validation_indices,
     summarize_qerror,
 )
 
@@ -124,128 +124,7 @@ def row_loss(
     ).square()
 
 
-def select_epoch(
-    frame: pd.DataFrame,
-    train_index: np.ndarray,
-    validation_index: np.ndarray,
-    max_epochs: int,
-    model_seed: int,
-) -> tuple[int, pd.DataFrame]:
-    features, targets, tree, query_sizes, conditions = prepare_arrays(frame)
-    train_x, validation_x, _ = normalize_fold(
-        features[train_index],
-        features[validation_index],
-        query_sizes[train_index],
-        query_sizes[validation_index],
-    )
-    model = build_model(model_seed)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=1e-3,
-        weight_decay=1e-3,
-    )
-    x_train = torch.tensor(train_x, dtype=torch.float32)
-    x_validation = torch.tensor(validation_x, dtype=torch.float32)
-    condition_train = torch.tensor(
-        conditions[train_index],
-        dtype=torch.float32,
-    )
-    condition_validation = torch.tensor(
-        conditions[validation_index],
-        dtype=torch.float32,
-    )
-    target_train = torch.tensor(
-        targets[train_index],
-        dtype=torch.float32,
-    )
-    target_validation = torch.tensor(
-        targets[validation_index],
-        dtype=torch.float32,
-    )
-    tree_train = torch.tensor(
-        tree[train_index],
-        dtype=torch.float32,
-    )
-    tree_validation = torch.tensor(
-        tree[validation_index],
-        dtype=torch.float32,
-    )
-    train_weight = size_balanced_weights(frame, train_index)
-    validation_weight = size_balanced_weights(
-        frame,
-        validation_index,
-    )
-
-    curve: list[dict[str, float | int | bool]] = []
-    best_epoch = -1
-    best_validation_loss = math.inf
-    for epoch in range(1, max_epochs + 1):
-        model.train()
-        train_predictions = predict_logs(
-            model,
-            x_train,
-            condition_train,
-            tree_train,
-        )
-        train_loss = (
-            row_loss(train_predictions, target_train)
-            * train_weight
-        ).mean()
-        optimizer.zero_grad(set_to_none=True)
-        train_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-        optimizer.step()
-
-        model.eval()
-        with torch.no_grad():
-            validation_predictions = predict_logs(
-                model,
-                x_validation,
-                condition_validation,
-                tree_validation,
-            )
-            validation_loss = (
-                row_loss(
-                    validation_predictions,
-                    target_validation,
-                )
-                * validation_weight
-            ).mean()
-        validation_loss_value = float(validation_loss.item())
-        validation_values = (
-            validation_predictions.cpu().numpy().astype(np.float64)
-        )
-        validation_qerror = qerror_from_logs(
-            validation_values,
-            targets[validation_index],
-        )
-        selected = validation_loss_value < best_validation_loss
-        if selected:
-            best_validation_loss = validation_loss_value
-            best_epoch = epoch
-        curve.append(
-            {
-                "epoch": epoch,
-                "train_loss": float(train_loss.item()),
-                "validation_loss": validation_loss_value,
-                "validation_q50": float(
-                    np.quantile(validation_qerror, 0.50)
-                ),
-                "validation_q95": float(
-                    np.quantile(validation_qerror, 0.95)
-                ),
-                "validation_max_qerror": float(
-                    np.max(validation_qerror)
-                ),
-                "best_so_far": selected,
-            }
-        )
-    if best_epoch <= 0:
-        raise RuntimeError("no validation checkpoint selected")
-    return best_epoch, pd.DataFrame(curve)
-
-
-def retrain_and_predict(
+def train_and_predict(
     frame: pd.DataFrame,
     train_index: np.ndarray,
     test_index: np.ndarray,
@@ -324,34 +203,17 @@ def retrain_and_predict(
 def run_fold(
     frame: pd.DataFrame,
     outer_fold: int,
-    max_epochs: int,
+    epochs: int,
     seed_base: int,
-    validation_seed: int,
-) -> tuple[dict[str, float | int | str], pd.DataFrame, pd.DataFrame]:
-    train_index, validation_index, test_index = (
-        stable_validation_indices(
-            frame,
-            outer_fold,
-            validation_seed,
-        )
-    )
+) -> tuple[dict[str, float | int | str], pd.DataFrame]:
+    train_index, test_index = outer_fold_indices(frame, outer_fold)
     model_seed = seed_base + outer_fold
     started = time.time()
-    selected_epoch, curve = select_epoch(
+    test_predictions = train_and_predict(
         frame,
         train_index,
-        validation_index,
-        max_epochs,
-        model_seed,
-    )
-    full_train_index = np.sort(
-        np.concatenate([train_index, validation_index])
-    )
-    test_predictions = retrain_and_predict(
-        frame,
-        full_train_index,
         test_index,
-        selected_epoch,
+        epochs,
         model_seed,
     )
     targets = frame["target_log"].to_numpy(dtype=np.float64)[
@@ -369,7 +231,6 @@ def run_fold(
             ].to_numpy(),
             "fold": frame.iloc[test_index]["fold"].to_numpy(dtype=int),
             "outer_fold": outer_fold,
-            "selected_epoch": selected_epoch,
             "target_log": targets,
             "pred_log": test_predictions,
             "signed_log10_qerror": (
@@ -379,44 +240,36 @@ def run_fold(
             "qerror": qerrors,
         }
     )
-    curve.insert(0, "dataset", str(frame["dataset"].iloc[0]))
-    curve.insert(1, "outer_fold", outer_fold)
-    curve["selected"] = curve["epoch"].eq(selected_epoch)
-    selected_row = curve.loc[curve["selected"]].iloc[0]
     summary = {
         "dataset": str(frame["dataset"].iloc[0]),
         "outer_fold": outer_fold,
-        "train_rows_for_selection": len(train_index),
-        "validation_rows": len(validation_index),
-        "retrain_rows": len(full_train_index),
+        "train_rows": len(train_index),
         "test_rows": len(test_index),
-        "selected_epoch": selected_epoch,
-        "selected_validation_loss": float(
-            selected_row["validation_loss"]
-        ),
-        "selected_validation_q50": float(
-            selected_row["validation_q50"]
-        ),
-        "selected_validation_q95": float(
-            selected_row["validation_q95"]
-        ),
+        "epochs": epochs,
         **summarize_qerror(qerrors),
         "elapsed_seconds": time.time() - started,
     }
-    return summary, rows, curve
+    return summary, rows
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--frame", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--max-epochs", type=int, default=400)
+    parser.add_argument(
+        "--epochs",
+        "--max-epochs",
+        dest="epochs",
+        type=int,
+        default=400,
+    )
     parser.add_argument("--seed-base", type=int, default=42)
-    parser.add_argument("--validation-seed", type=int, default=20260722)
     parser.add_argument("--expected-rows", type=int, default=0)
     parser.add_argument("--torch-threads", type=int, default=1)
     args = parser.parse_args()
 
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be positive")
     if args.out_dir.exists():
         raise FileExistsError(
             f"refusing to overwrite: {args.out_dir}"
@@ -431,22 +284,19 @@ def main() -> None:
 
     summaries = []
     row_frames = []
-    curve_frames = []
     for dataset in sorted(frame["dataset"].unique()):
         scoped = frame.loc[
             frame["dataset"].eq(dataset)
         ].reset_index(drop=True)
         for outer_fold in range(5):
-            summary, rows, curve = run_fold(
+            summary, rows = run_fold(
                 scoped,
                 outer_fold,
-                args.max_epochs,
+                args.epochs,
                 args.seed_base,
-                args.validation_seed,
             )
             summaries.append(summary)
             row_frames.append(rows)
-            curve_frames.append(curve)
             print(json.dumps(summary), flush=True)
 
     summary_frame = pd.DataFrame(summaries).sort_values(
@@ -454,9 +304,6 @@ def main() -> None:
     )
     rows = pd.concat(row_frames, ignore_index=True).sort_values(
         ["dataset", "query_size", "query_name"]
-    ).reset_index(drop=True)
-    curves = pd.concat(curve_frames, ignore_index=True).sort_values(
-        ["dataset", "outer_fold", "epoch"]
     ).reset_index(drop=True)
     if len(rows) != len(frame):
         raise RuntimeError("outer-test prediction coverage mismatch")
@@ -482,31 +329,14 @@ def main() -> None:
         "macro_geomean_q95": float(
             np.exp(np.log(query_sets["set_q95"]).mean())
         ),
-        "selected_epoch_min": int(
-            summary_frame["selected_epoch"].min()
-        ),
-        "selected_epoch_median": float(
-            summary_frame["selected_epoch"].median()
-        ),
-        "selected_epoch_max": int(
-            summary_frame["selected_epoch"].max()
-        ),
-        "selected_at_max_epochs": int(
-            summary_frame["selected_epoch"]
-            .eq(args.max_epochs)
-            .sum()
-        ),
+        "training_epochs": args.epochs,
     }
     summary_frame.to_csv(
-        args.out_dir / "model_selection_summary.csv",
+        args.out_dir / "fold_summary.csv",
         index=False,
     )
     rows.to_csv(
         args.out_dir / "outer_test_rows.csv.gz",
-        index=False,
-    )
-    curves.to_csv(
-        args.out_dir / "validation_curves.csv.gz",
         index=False,
     )
     query_sets.to_csv(
@@ -518,11 +348,7 @@ def main() -> None:
         encoding="utf-8",
     )
     manifest = {
-        "data_split": (
-            "five outer folds; 20% test; the remaining 80% split "
-            "by query size into approximately 70% train and 10% "
-            "validation"
-        ),
+        "data_split": "five folds; 80% train and 20% test",
         "features": FEATURES,
         "groups": [[0, 1, 2], [3, 4], [5, 6], [7, 8, 9, 10]],
         "candidate_tree_strategy": "mwst_low_density_edges",
@@ -534,16 +360,8 @@ def main() -> None:
             "9 and 10 remain on native scales"
         ),
         "loss": "uniform query-size-balanced count-domain MSLE",
-        "selected_hyperparameter": "training epoch only",
-        "checkpoint_candidates": (
-            f"every epoch from 1 to {args.max_epochs}"
-        ),
-        "retraining": (
-            "reinitialize and train on the complete 80% "
-            "outer-training partition"
-        ),
+        "training_epochs": args.epochs,
         "seed_base": args.seed_base,
-        "validation_seed": args.validation_seed,
         "trainable_parameters": EXPECTED_PARAMETERS,
         "mlp_is_final_predictor": True,
         "post_mlp_replacement": False,

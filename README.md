@@ -57,6 +57,11 @@ python src/candidate_tree_estimator/train.py \
   --out-dir results/yeast_run
 ```
 
+The training runner uses five-fold cross-validation. In each run, four folds
+(80%) train the model for 400 epochs and the remaining fold (20%) is used only
+for testing. Model parameters and feature-normalization statistics are fitted
+independently in every run.
+
 ## Benchmark Data
 
 The yeast data graph is distributed with the
